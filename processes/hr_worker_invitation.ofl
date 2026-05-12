@@ -1,0 +1,351 @@
+PROCESS WorkerInvitation
+VERSION 1.0
+OWNER HRDepartment
+PURPOSE "Invite an existing web application user to become a worker of the organization."
+EFFECTIVE_FROM 2026-05-12
+
+INCLUDE "library/escalation_chains.ofl"
+INCLUDE "library/notification_templates.ofl"
+
+# ---------------------------------------------------------------------------
+# ROLES
+# ---------------------------------------------------------------------------
+
+ROLES
+    HiringManager
+    HRExecutive
+    HRHead
+    DepartmentHead
+    ITAdmin
+    System
+    Candidate                EXTERNAL
+
+# ---------------------------------------------------------------------------
+# INPUTS / OUTPUTS
+# ---------------------------------------------------------------------------
+
+INPUTS
+    InvitationRequest {
+        id                : UUID                                                      AUTO
+        username          : Text                                                      REQUIRED   # username in the web application
+        proposed_role     : Text                                                      REQUIRED
+        department        : Text                                                      REQUIRED
+        employment_type   : Enum(FullTime, PartTime, Contract, Intern)                REQUIRED
+        start_date        : Date                                                      REQUIRED
+        reports_to        : Text                                                      REQUIRED   # identity of the manager
+        compensation      : Money                                                     OPTIONAL   # may be set in a separate process
+        reason            : Text(min=10, max=500)                                     REQUIRED
+        requested_by      : Text                                                      AUTO       # identity of the submitter
+        created_at        : DateTime                                                  AUTO
+    }
+
+OUTPUTS
+    WorkerRecord
+    DeclineRecord
+    AccessProvisioningHandoff
+
+# ---------------------------------------------------------------------------
+# STATES
+# ---------------------------------------------------------------------------
+
+STATES
+    NEW                 -> VALIDATING
+    VALIDATING          -> { AWAITING_APPROVAL, REJECTED }
+    AWAITING_APPROVAL   -> { INVITE_SENT, REJECTED }
+    INVITE_SENT         -> { ACCEPTED, DECLINED, EXPIRED }
+    ACCEPTED            -> PROVISIONING
+    PROVISIONING        -> CLOSED
+    REJECTED            -> CLOSED
+    DECLINED            -> CLOSED
+    EXPIRED             -> CLOSED
+    # CLOSED is terminal
+
+# ---------------------------------------------------------------------------
+# FLOW
+# ---------------------------------------------------------------------------
+
+FLOW
+
+    HiringManager
+        [s_request]      SUBMIT InvitationRequest
+
+    System
+        [s_lookup]       VERIFY InvitationRequest.username EXISTS_IN WebApplication
+                         SLA 1m CALENDAR
+        [s_dup_check]    VERIFY InvitationRequest.username NOT_ALREADY_WORKER
+        [s_fetch]        FETCH user_account FROM WebApplication
+                         WHERE username == InvitationRequest.username
+                         BIND candidate_email   = user_account.email
+                         BIND candidate_name    = user_account.display_name
+                         BIND email_verified    = user_account.email_verified
+
+    HRExecutive
+        [s_review]       VERIFY InvitationRequest                                     SLA 4h BUSINESS
+                         CONFIRM email_verified == True
+                         CONFIRM candidate_email IS_VALID
+
+    # -----------------------------------------------------------------------
+    # Approval branches by employment type
+    # -----------------------------------------------------------------------
+
+    IF InvitationRequest.employment_type == Contract
+        APPROVAL ContractApproval
+            REQUEST_FROM DepartmentHead
+            QUORUM ANY
+            SLA 24h BUSINESS
+            ON_TIMEOUT ESCALATE HRHead
+    ELIF InvitationRequest.employment_type == Intern
+        APPROVAL InternApproval
+            REQUEST_FROM HRHead
+            QUORUM ANY
+            SLA 24h BUSINESS
+            ON_TIMEOUT ESCALATE Committee
+    ELSE
+        APPROVAL HiringApproval
+            STAGES
+                STAGE 1 REQUEST_FROM DepartmentHead   QUORUM ANY   SLA 24h BUSINESS
+                STAGE 2 REQUEST_FROM HRHead           QUORUM ANY   SLA 24h BUSINESS
+            REQUIRE_ALL_STAGES
+            ON_TIMEOUT ESCALATE Committee
+    END
+
+    # -----------------------------------------------------------------------
+    # Generate invitation token and deliver
+    # -----------------------------------------------------------------------
+
+    System
+        [s_token]        GENERATE InvitationToken {
+                             invitation_id : InvitationRequest.id
+                             username      : InvitationRequest.username
+                             expires_at    : NOW + 7d CALENDAR
+                         }
+        [s_send]         NOTIFY Candidate
+                         VIA Email
+                         TEMPLATE "worker_invitation"
+                         PARAMS {
+                             name         : candidate_name
+                             role         : InvitationRequest.proposed_role
+                             department   : InvitationRequest.department
+                             start_date   : InvitationRequest.start_date
+                             accept_url   : InvitationToken.accept_url
+                             decline_url  : InvitationToken.decline_url
+                             expires_at   : InvitationToken.expires_at
+                         }
+                         FALLBACK InApp IF Email_FAILED
+                         RETRY 3 INTERVAL 1h
+
+    # -----------------------------------------------------------------------
+    # Candidate response
+    # -----------------------------------------------------------------------
+
+    Candidate
+        [s_respond]      RESPOND TO Invitation                                        SLA 7d CALENDAR
+                         # outcome ∈ { Accepted, Declined }
+
+    IF [s_respond].outcome == Accepted
+
+        Candidate
+            [s_profile]  SUBMIT WorkerProfile {
+                             full_name            : Text                              REQUIRED
+                             date_of_birth        : Date                              REQUIRED
+                             government_id_type   : Enum(Aadhaar, Passport, PAN)      REQUIRED
+                             government_id_value  : Text                              REQUIRED IMMUTABLE
+                             address              : Text                              REQUIRED
+                             emergency_contact    : Text                              REQUIRED
+                             bank_account         : Text                              REQUIRED
+                             tax_id               : Text                              OPTIONAL
+                         }
+
+        HRExecutive
+            [s_verify_profile]
+                         VERIFY WorkerProfile                                         SLA 8h BUSINESS
+                         CHECK government_id_value FORMAT_VALID
+                         CHECK bank_account FORMAT_VALID
+
+        System
+            [s_create]   CREATE WorkerRecord {
+                             worker_id        : GENERATE_WORKER_ID()
+                             username         : InvitationRequest.username
+                             role             : InvitationRequest.proposed_role
+                             department       : InvitationRequest.department
+                             employment_type  : InvitationRequest.employment_type
+                             start_date       : InvitationRequest.start_date
+                             reports_to       : InvitationRequest.reports_to
+                             profile          : WorkerProfile
+                             status           : Pending_Onboarding
+                             created_at       : NOW
+                         }
+
+        ITAdmin
+            [s_provision]
+                         CREATE AccessProvisioningHandoff {
+                             worker_id   : WorkerRecord.worker_id
+                             role        : WorkerRecord.role
+                             department  : WorkerRecord.department
+                         }
+                         SLA 24h BUSINESS
+
+        HRExecutive
+            [s_onboard]  CALL_PROCESS WorkerOnboarding(worker: WorkerRecord)
+                         DETACHED
+            [s_close_ok] CLOSE Invitation
+                         STORE WorkerRecord
+
+    ELSE   # Declined
+
+        Candidate
+            [s_reason]   SUBMIT decline_reason : Text                                 OPTIONAL
+
+        HRExecutive
+            [s_log]      STORE DeclineRecord {
+                             invitation_id : InvitationRequest.id
+                             username      : InvitationRequest.username
+                             reason        : decline_reason
+                             declined_at   : NOW
+                         }
+                         NOTIFY HiringManager VIA Email TEMPLATE "invitation_declined"
+            [s_close_no] CLOSE Invitation
+
+    END
+
+# ---------------------------------------------------------------------------
+# FAILURES
+# ---------------------------------------------------------------------------
+
+FAILURES
+
+    IF [s_lookup] FAILS
+        REJECT InvitationRequest REASON "Username not found in web application"
+        NOTIFY HiringManager VIA Email TEMPLATE "username_not_found"
+
+    IF [s_dup_check] FAILS
+        REJECT InvitationRequest REASON "Username already belongs to an existing worker"
+        NOTIFY HiringManager VIA Email TEMPLATE "already_worker"
+
+    IF [s_review] FAILS
+        REJECT InvitationRequest REASON HRExecutive.rejection_reason
+        NOTIFY HiringManager VIA Email TEMPLATE "review_failed"
+
+    IF [s_review] NO_RESPONSE 8h BUSINESS
+        ESCALATE HRHead
+        NOTIFY HRExecutive VIA Email, SMS
+
+    IF HiringApproval REJECTED
+        REJECT InvitationRequest REASON HiringApproval.rejection_reason
+        NOTIFY HiringManager VIA Email TEMPLATE "invitation_rejected"
+
+    IF [s_send] FAILS AFTER RETRY
+        ESCALATE HRExecutive
+        NOTIFY HiringManager VIA Email TEMPLATE "invite_delivery_failed"
+
+    IF [s_respond] NO_RESPONSE 7d CALENDAR
+        CANCEL Invitation REASON "Invitation expired without response"
+        NOTIFY HiringManager VIA Email TEMPLATE "invitation_expired"
+        NOTIFY HRExecutive   VIA Email TEMPLATE "invitation_expired"
+
+    IF [s_verify_profile] FAILS
+        REQUEST_REVISION FROM Candidate
+        NOTIFY Candidate VIA Email TEMPLATE "profile_revision_needed"
+        SLA 48h CALENDAR
+        ON_TIMEOUT CANCEL Invitation REASON "Profile not completed"
+
+    IF [s_provision] DELAY > 24h BUSINESS
+        ESCALATE ITHead
+        NOTIFY HRHead VIA Email
+
+# ---------------------------------------------------------------------------
+# ESCALATIONS
+# ---------------------------------------------------------------------------
+
+ESCALATIONS
+    Level1 HRExecutive          SLA 8h  BUSINESS
+    Level2 HRHead               SLA 24h BUSINESS
+    Level3 Committee            SLA 48h BUSINESS
+
+# ---------------------------------------------------------------------------
+# RULES
+# ---------------------------------------------------------------------------
+
+RULES
+
+    HiringManager
+        MAY_NOT_DELEGATE Submission              # the actual hiring manager must request
+
+    HRExecutive
+        MAY_DELEGATE Verification TO HRAssistant
+        MAY_NOT_DELEGATE Closure
+        SUBSTITUTE_BY OtherHRExecutive ON LEAVE
+
+    HRHead
+        SUBSTITUTE_BY HRDeputy ON LEAVE > 2d
+
+    DepartmentHead
+        SUBSTITUTE_BY DepartmentDeputy ON LEAVE > 2d
+
+    PERMISSIONS
+
+        HiringManager
+            CAN    VIEW   InvitationRequest WHERE requested_by == ACTOR
+            CAN    VIEW   WorkerRecord.role, WorkerRecord.start_date
+            CANNOT VIEW   WorkerProfile.bank_account
+            CANNOT VIEW   WorkerProfile.government_id_value
+            CANNOT VIEW   WorkerProfile.tax_id
+
+        HRExecutive
+            CAN    VIEW   InvitationRequest, WorkerProfile, WorkerRecord
+            CAN    CLOSE  Invitation WHEN state IN { PROVISIONING, DECLINED, EXPIRED, REJECTED }
+
+        ITAdmin
+            CAN    VIEW   WorkerRecord
+            CANNOT VIEW   WorkerProfile.bank_account
+            CANNOT VIEW   WorkerProfile.government_id_value
+
+        Candidate
+            CAN    VIEW   InvitationRequest WHERE username == ACTOR.username
+            CAN    UPDATE WorkerProfile WHERE username == ACTOR.username BEFORE [s_verify_profile]
+
+# ---------------------------------------------------------------------------
+# EVIDENCE / AUDIT
+# ---------------------------------------------------------------------------
+
+EVIDENCE
+    InvitationRequest          REQUIRED AT [s_request]
+    ApprovalRecord             REQUIRED AT HiringApproval
+    InvitationToken            REQUIRED AT [s_token]
+    DeliveryReceipt            REQUIRED AT [s_send]
+    WorkerProfile              REQUIRED AT [s_profile]
+    WorkerRecord               REQUIRED AT [s_create]
+    AccessProvisioningHandoff  REQUIRED AT [s_provision]
+    DeclineRecord              OPTIONAL AT [s_log]
+
+AUDIT
+    RETAIN WorkerRecord              7y
+    RETAIN ApprovalRecord            7y
+    RETAIN DeclineRecord             3y
+    RETAIN WorkerProfile             EMPLOYMENT_END + 7y       # tax / labour law retention
+    RETAIN DeliveryReceipt           1y
+    LOG ALL_ESCALATIONS
+    LOG ALL_APPROVAL_DECISIONS
+    LOG ALL_PII_ACCESS
+    IMMUTABLE_AFTER CLOSE
+
+# ---------------------------------------------------------------------------
+# METRICS
+# ---------------------------------------------------------------------------
+
+METRICS
+
+    TRACK InvitationsSent          WINDOW 30d
+    TRACK AcceptanceRate           FROM [s_send]    TO [s_close_ok]
+    TRACK DeclineRate              FROM [s_send]    TO [s_close_no]
+    TRACK ExpiryRate               SNAPSHOT WEEKLY
+    TRACK TimeToApproval           FROM [s_request] TO HiringApproval.Decision
+    TRACK TimeToAccept             FROM [s_send]    TO [s_respond]
+    TRACK TimeToProvision          FROM [s_create]  TO [s_provision]
+    TRACK ApprovalRejectionRate    PER HiringManager
+    TRACK DeliveryFailureRate      PER NotificationChannel
+
+    ALERT WHEN ExpiryRate          > 25%
+    ALERT WHEN TimeToApproval.median  > 48h BUSINESS
+    ALERT WHEN TimeToProvision        > 24h BUSINESS
+    ALERT WHEN DeliveryFailureRate    > 5%
